@@ -8,8 +8,8 @@ final class RecordingSession {
     let dir: URL
     let startedAt = Date()
 
-    private let mic = MicRecorder()
-    private let system = SystemAudioRecorder()
+    private let mic: MicRecorder
+    private let system: SystemAudioRecorder
 
     private static let folderFormat: DateFormatter = {
         let f = DateFormatter()
@@ -20,7 +20,14 @@ final class RecordingSession {
 
     /// Create the session folder under `root` (yyyy.MM.dd-HHmm, suffixed on
     /// collision) without starting capture yet.
-    init(root: URL) throws {
+    init(
+        root: URL,
+        onMicBuffer: AudioBufferHandler? = nil,
+        onSystemBuffer: AudioBufferHandler? = nil
+    ) throws {
+        mic = MicRecorder(onBuffer: onMicBuffer)
+        system = SystemAudioRecorder(onBuffer: onSystemBuffer)
+
         let base = Self.folderFormat.string(from: startedAt)
         var candidate = root.appendingPathComponent(base, isDirectory: true)
         var n = 2

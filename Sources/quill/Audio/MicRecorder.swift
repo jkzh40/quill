@@ -30,6 +30,7 @@ final class MicRecorder: @unchecked Sendable {
     private var engine = AVAudioEngine()
     private var file: AVAudioFile?
     private var url: URL?
+    private let onBuffer: AudioBufferHandler?
     private(set) var isRecording = false
     /// Wall-clock time of the first captured buffer — the track's true start,
     /// used to offset-align the two tracks' transcript timestamps.
@@ -40,6 +41,10 @@ final class MicRecorder: @unchecked Sendable {
     private var livenessFrames = 0
     private var livenessPeak: Float = 0
     private var livenessSettled = false
+
+    init(onBuffer: AudioBufferHandler? = nil) {
+        self.onBuffer = onBuffer
+    }
 
     /// Start capturing the mic, encoding AAC into `url` (use a .caf extension
     /// — CAF needs no finalization pass, so a crash loses nothing written).
@@ -174,6 +179,7 @@ final class MicRecorder: @unchecked Sendable {
 
             do {
                 try file.write(from: buffer)
+                self.publish(buffer)
             } catch {
                 FileHandle.standardError.write(Data("mic track write failed: \(error)\n".utf8))
             }
@@ -200,10 +206,18 @@ final class MicRecorder: @unchecked Sendable {
             do {
                 try converter.convert(to: mono, from: buffer)
                 try file.write(from: mono)
+                self.publish(mono)
             } catch {
                 FileHandle.standardError.write(Data("mic track write failed: \(error)\n".utf8))
             }
         }
+    }
+
+    /// Recorder callback buffers are reused by AVAudioEngine. Copy before
+    /// handing one to asynchronous consumers such as live transcription.
+    private func publish(_ buffer: AVAudioPCMBuffer) {
+        guard let onBuffer, let copy = CapturedAudioBuffer(copying: buffer) else { return }
+        onBuffer(copy)
     }
 
     /// The voice-processing route delivered a full second of digital silence:

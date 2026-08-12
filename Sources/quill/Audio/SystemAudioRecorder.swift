@@ -33,11 +33,16 @@ final class SystemAudioRecorder {
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
     private var file: AVAudioFile?
+    private let onBuffer: AudioBufferHandler?
     private let queue = DispatchQueue(label: "com.digimata.quill.system-tap")
     private(set) var isRecording = false
     /// Wall-clock time of the first captured buffer — the track's true start,
     /// used to offset-align the two tracks' transcript timestamps.
     private(set) var firstBufferAt: Date?
+
+    init(onBuffer: AudioBufferHandler? = nil) {
+        self.onBuffer = onBuffer
+    }
 
     /// Start capturing system audio, encoding AAC into `url` (use a .caf
     /// extension — CAF needs no finalization pass, so a crash mid-meeting
@@ -146,6 +151,9 @@ final class SystemAudioRecorder {
             ) else { return }
             do {
                 try file.write(from: buffer)
+                if let onBuffer, let copy = CapturedAudioBuffer(copying: buffer) {
+                    onBuffer(copy)
+                }
             } catch {
                 FileHandle.standardError.write(Data("system track write failed: \(error)\n".utf8))
             }

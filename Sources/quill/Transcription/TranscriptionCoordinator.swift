@@ -14,7 +14,13 @@ actor TranscriptionCoordinator {
         case failed(session: String)
     }
 
-    private var queue: [URL] = []
+    private struct Job {
+        let dir: URL
+        let notificationsEnabled: Bool
+        let completion: CheckedContinuation<Void, Error>?
+    }
+
+    private var queue: [Job] = []
     private var draining = false
     private var engine: TranscriptionEngine?
     private var lastFailure: String?
@@ -31,8 +37,30 @@ actor TranscriptionCoordinator {
             runHook(for: sessionDir)
             return
         }
-        queue.append(sessionDir)
+        queue.append(Job(dir: sessionDir, notificationsEnabled: true, completion: nil))
         drainIfIdle()
+    }
+
+    /// Queue one session and suspend until its transcript has been written and
+    /// the engine has been released. Used by the headless CLI so a successful
+    /// exit means downstream scripts can consume the finished transcript.
+    func enqueueAndWait(
+        _ sessionDir: URL,
+        transcriptionEnabled: Bool,
+        notificationsEnabled: Bool
+    ) async throws {
+        guard transcriptionEnabled else {
+            runHook(for: sessionDir)
+            return
+        }
+        try await withCheckedThrowingContinuation { continuation in
+            queue.append(Job(
+                dir: sessionDir,
+                notificationsEnabled: notificationsEnabled,
+                completion: continuation
+            ))
+            drainIfIdle()
+        }
     }
 
     /// Scan the recordings root for sessions that finished (meta.json exists)
@@ -51,8 +79,9 @@ actor TranscriptionCoordinator {
                     && !fm.fileExists(atPath: $0.appendingPathComponent("transcript.json").path)
             }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        for dir in pending where !queue.contains(dir) {
-            queue.append(dir)
+        let queuedDirs = Set(queue.map(\.dir))
+        for dir in pending where !queuedDirs.contains(dir) {
+            queue.append(Job(dir: dir, notificationsEnabled: true, completion: nil))
         }
         if !pending.isEmpty {
             FileHandle.standardError.write(Data(
@@ -72,26 +101,41 @@ actor TranscriptionCoordinator {
     }
 
     private func drain() async {
+        var completions: [(CheckedContinuation<Void, Error>, Result<Void, Error>)] = []
         while !queue.isEmpty {
-            let dir = queue.removeFirst()
+            let job = queue.removeFirst()
+            let dir = job.dir
             publish(.transcribing(session: dir.lastPathComponent, queued: queue.count))
             do {
                 try await transcribe(dir)
-                notifyUser(title: "quill — transcript ready", body: dir.lastPathComponent)
+                if job.notificationsEnabled {
+                    notifyUser(title: "quill — transcript ready", body: dir.lastPathComponent)
+                }
                 runHook(for: dir)
+                if let completion = job.completion {
+                    completions.append((completion, .success(())))
+                }
             } catch {
                 log(dir, "transcription failed: \(error)")
                 lastFailure = dir.lastPathComponent
-                notifyUser(
-                    title: "quill — transcription failed",
-                    body: "\(dir.lastPathComponent) — see transcribe.log"
-                )
+                if job.notificationsEnabled {
+                    notifyUser(
+                        title: "quill — transcription failed",
+                        body: "\(dir.lastPathComponent) — see transcribe.log"
+                    )
+                }
+                if let completion = job.completion {
+                    completions.append((completion, .failure(error)))
+                }
             }
         }
         await engine?.release()
         engine = nil
         publish(lastFailure.map { .failed(session: $0) } ?? .idle)
         draining = false
+        for (continuation, result) in completions {
+            continuation.resume(with: result)
+        }
         // An enqueue that landed between the loop exiting and the release
         // finishing would otherwise sit until the next enqueue.
         drainIfIdle()

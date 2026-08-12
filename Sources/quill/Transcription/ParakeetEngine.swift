@@ -28,7 +28,7 @@ actor ParakeetEngine: TranscriptionEngine {
 
     func prepare() async throws {
         guard manager == nil else { return }
-        let models = try await AsrModels.downloadAndLoad(version: .v2)
+        let models = try await ParakeetModelLoader.loadV2()
         let manager = AsrManager()
         try await manager.loadModels(models)
         self.manager = manager
@@ -60,44 +60,94 @@ actor ParakeetEngine: TranscriptionEngine {
                 ? []
                 : [TranscriptSegment(start: 0, end: result.duration, text: text)]
         }
-        return Self.segments(from: words)
+        return TranscriptSegmenter.segments(from: words)
     }
 
     func release() async {
         if let manager { await manager.cleanup() }
         manager = nil
     }
+}
 
-    /// Group word timings into readable segments: break on sentence-ending
-    /// punctuation (parakeet v2 emits punctuation), a silence gap, or a hard
-    /// length cap so a run-on speaker still wraps.
-    private static func segments(from words: [WordTiming]) -> [TranscriptSegment] {
+/// The word-to-segment policy shared by canonical and live transcription.
+/// Keeping this in one place makes the live Markdown use the same sentence,
+/// silence-gap, and length boundaries as the final transcript.
+enum TranscriptSegmenter {
+    static func segments(from words: [WordTiming]) -> [TranscriptSegment] {
+        var segmenter = IncrementalTranscriptSegmenter()
+        var out = segmenter.append(words)
+        if let final = segmenter.finish() { out.append(final) }
+        return out
+    }
+}
+
+/// Stateful form of `TranscriptSegmenter` for word timings that arrive one
+/// decoded window at a time. It intentionally keeps an unfinished sentence
+/// across window boundaries instead of emitting punctuation-only fragments.
+struct IncrementalTranscriptSegmenter {
+    private var current: [WordTiming] = []
+
+    var openStart: TimeInterval? { current.first?.startTime }
+
+    mutating func append(_ words: [WordTiming]) -> [TranscriptSegment] {
         var out: [TranscriptSegment] = []
-        var current: [WordTiming] = []
-
-        func flush() {
-            guard let first = current.first, let last = current.last else { return }
-            out.append(TranscriptSegment(
-                start: first.startTime,
-                end: last.endTime,
-                text: current.map(\.word).joined(separator: " ")
-            ))
-            current = []
-        }
-
         for word in words {
-            if let last = current.last, word.startTime - last.endTime > 1.0 {
-                flush()
+            if let last = current.last, word.startTime - last.endTime > 1.0,
+               let segment = flush()
+            {
+                out.append(segment)
             }
             current.append(word)
             let endsSentence = word.word.hasSuffix(".")
                 || word.word.hasSuffix("?")
                 || word.word.hasSuffix("!")
-            if endsSentence || current.count >= 60 {
-                flush()
+            if (endsSentence || current.count >= 60), let segment = flush() {
+                out.append(segment)
             }
         }
-        flush()
         return out
+    }
+
+    mutating func finish() -> TranscriptSegment? {
+        flush()
+    }
+
+    private mutating func flush() -> TranscriptSegment? {
+        guard let first = current.first, let last = current.last else { return nil }
+        defer { current = [] }
+        let text = Self.render(current)
+        // Parakeet occasionally emits a second bare period at a sliding-window
+        // seam. It carries no spoken content and cannot usefully stand alone in
+        // either the canonical or append-only live transcript.
+        guard text.unicodeScalars.contains(where: CharacterSet.alphanumerics.contains) else {
+            return nil
+        }
+        return TranscriptSegment(
+            start: first.startTime,
+            end: last.endTime,
+            text: text
+        )
+    }
+
+    /// FluidAudio usually includes punctuation on the word, but a seam token
+    /// can be just ".". Attach such tokens to an open sentence without adding
+    /// the otherwise visible space before punctuation.
+    private static func render(_ words: [WordTiming]) -> String {
+        var text = ""
+        for timing in words {
+            let word = timing.word.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !word.isEmpty else { continue }
+            let hasAlphanumeric = word.unicodeScalars.contains(
+                where: CharacterSet.alphanumerics.contains
+            )
+            if text.isEmpty {
+                text = word
+            } else if hasAlphanumeric {
+                text += " \(word)"
+            } else {
+                text += word
+            }
+        }
+        return text
     }
 }

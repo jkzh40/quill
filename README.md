@@ -99,10 +99,32 @@ Optional, at `~/.config/quill/config.json`:
 ```sh
 quill                        # run the menu-bar daemon (^C to quit)
 quill run --out <dir>        # custom recordings root (default ~/Recordings)
+quill record                 # headless: record immediately, stop with ^C
+quill record --out <dir>     # headless with a custom recordings root
+quill record --no-transcribe # skip the canonical post-recording transcript
+quill record --live-transcript <file> # append transcript chunks while recording
 quill doctor                 # check permissions, recordings folder, models
 quill install --launch-at-login
 quill install --uninstall
 ```
+
+`quill record` creates no application or menu-bar item. It records until
+`Ctrl-C`, stops both tracks cleanly, and waits for transcription to finish
+before exiting. Progress goes to stderr, desktop notifications are suppressed,
+and the completed session directory is printed to stdout. This makes the
+command suitable for scripts that consume the session directory or transcript
+after a successful exit.
+
+Add `--live-transcript <file>` to append speaker-tagged Markdown chunks while
+recording. Quill never reads or rewrites this file: it reopens the current path
+for each append, so existing and simultaneous edits are disregarded. An editor
+that saves by replacing the entire file can still discard unseen appended text;
+for reliable viewing, treat the live transcript as generated/read-only and keep
+personal notes in a separate file. Live transcription uses the cached Parakeet
+v2 models, the same word-to-segment rules as the canonical transcript, and
+aligned start/end timestamps across both tracks. It buffers enough left/right
+context for stable decoding, so output typically trails the audio by 13–15
+seconds.
 
 ## Stack
 
