@@ -115,16 +115,32 @@ and the completed session directory is printed to stdout. This makes the
 command suitable for scripts that consume the session directory or transcript
 after a successful exit.
 
-Add `--live-transcript <file>` to append speaker-tagged Markdown chunks while
-recording. Quill never reads or rewrites this file: it reopens the current path
-for each append, so existing and simultaneous edits are disregarded. An editor
-that saves by replacing the entire file can still discard unseen appended text;
-for reliable viewing, treat the live transcript as generated/read-only and keep
+Add `--live-transcript <file>` to append conversational Markdown blocks while
+recording:
+
+```markdown
+### me · 0:12–0:18
+
+I think the first approach is better. It avoids duplicating the state.
+
+### them · 0:19–0:21
+
+That makes sense.
+```
+
+Consecutive sentences from one speaker remain in the same turn. A speaker
+change or two seconds of confirmed silence closes the block. Canonical
+`transcript.md` uses the same turn layout, while `transcript.json` retains its
+more precise segment-level data.
+
+Quill never reads or rewrites the live file: it reopens the current path for
+each append, so existing and simultaneous edits are disregarded. An editor that
+saves by replacing the entire file can still discard unseen appended text; for
+reliable viewing, treat the live transcript as generated/read-only and keep
 personal notes in a separate file. Live transcription uses the cached Parakeet
-v2 models, the same word-to-segment rules as the canonical transcript, and
-aligned start/end timestamps across both tracks. It buffers enough left/right
-context for stable decoding, so output typically trails the audio by 13–15
-seconds.
+v2 models and aligned start/end timestamps across both tracks. It buffers enough
+left/right context for stable decoding and waits for a turn to close before
+appending it, so the display intentionally trails the conversation.
 
 ## Stack
 

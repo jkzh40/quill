@@ -302,18 +302,18 @@ private struct Transcript: Codable {
 
     private func rendered(title: String) -> String {
         var lines = ["# \(title)", "", "engine: \(engine) (\(model))", ""]
-        for seg in segments {
-            lines.append("**[\(Self.clock(seg.start_ms))] \(seg.speaker):** \(seg.text)")
+        let turns = TranscriptTurnAssembler.turns(from: segments.map {
+            SpeakerTranscriptSegment(
+                speaker: $0.speaker,
+                start: TimeInterval($0.start_ms) / 1000,
+                end: TimeInterval($0.end_ms) / 1000,
+                text: $0.text
+            )
+        })
+        for turn in turns {
+            lines.append(TranscriptTurnMarkdown.block(turn))
             lines.append("")
         }
         return lines.joined(separator: "\n")
-    }
-
-    private static func clock(_ ms: Int) -> String {
-        let total = ms / 1000
-        let h = total / 3600, m = (total % 3600) / 60, s = total % 60
-        return h > 0
-            ? String(format: "%d:%02d:%02d", h, m, s)
-            : String(format: "%d:%02d", m, s)
     }
 }

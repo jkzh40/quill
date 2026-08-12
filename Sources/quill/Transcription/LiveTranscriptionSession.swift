@@ -165,11 +165,13 @@ actor LiveTranscriptionSession {
         track: LiveTrack
     ) -> Task<Void, Never> {
         Task { [output] in
+            var reconciler = LiveWordReconciler()
             var segmenter = IncrementalTranscriptSegmenter()
             var processedWindows = 0
             for await update in updates {
                 processedWindows += 1
-                let segments = segmenter.append(buildWordTimings(from: update.tokenTimings))
+                let decoded = buildWordTimings(from: update.tokenTimings)
+                let segments = segmenter.append(reconciler.accept(decoded))
                 await output.receive(
                     segments,
                     from: track,
@@ -190,6 +192,61 @@ actor LiveTranscriptionSession {
     }
 }
 
+/// Suppresses only duplicate words that refer to the same moment in the audio.
+/// FluidAudio already reconciles token IDs across most sliding-window seams;
+/// this timing check covers residual updates without guessing whether a spoken
+/// repetition at a later timestamp was intentional.
+struct LiveWordReconciler {
+    private static let historySeconds: TimeInterval = 5
+
+    private var recent: [WordTiming] = []
+    private var latestEnd: TimeInterval = 0
+
+    mutating func accept(_ words: [WordTiming]) -> [WordTiming] {
+        var accepted: [WordTiming] = []
+        for word in words.sorted(by: Self.isEarlier) {
+            let candidates = recent + accepted
+            guard !candidates.contains(where: { Self.isSameTimedWord($0, word) }) else {
+                continue
+            }
+            accepted.append(word)
+            latestEnd = max(latestEnd, word.endTime)
+        }
+
+        recent += accepted
+        let cutoff = latestEnd - Self.historySeconds
+        recent.removeAll { $0.endTime < cutoff }
+        return accepted
+    }
+
+    private static func isEarlier(_ lhs: WordTiming, _ rhs: WordTiming) -> Bool {
+        if lhs.startTime != rhs.startTime { return lhs.startTime < rhs.startTime }
+        return lhs.endTime < rhs.endTime
+    }
+
+    private static func isSameTimedWord(_ lhs: WordTiming, _ rhs: WordTiming) -> Bool {
+        guard normalized(lhs.word) == normalized(rhs.word) else { return false }
+        let overlap = min(lhs.endTime, rhs.endTime) - max(lhs.startTime, rhs.startTime)
+        let shorterDuration = min(
+            max(0, lhs.endTime - lhs.startTime),
+            max(0, rhs.endTime - rhs.startTime)
+        )
+        if shorterDuration > 0, overlap / shorterDuration >= 0.5 { return true }
+
+        // Very short punctuation timings can shift by a frame and have too
+        // little duration for a useful overlap ratio.
+        return shorterDuration <= 0.05
+            && abs(lhs.startTime - rhs.startTime) <= 0.05
+    }
+
+    private static func normalized(_ word: String) -> String {
+        let folded = word.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+        let scalars = folded.unicodeScalars.filter(CharacterSet.alphanumerics.contains)
+        if !scalars.isEmpty { return String(String.UnicodeScalarView(scalars)) }
+        return folded.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 /// Holds completed segments until both decoders have advanced far enough that
 /// no earlier segment can still arrive. Track-relative model timestamps are
 /// shifted onto the same clock using the first captured buffer from each track.
@@ -207,6 +264,7 @@ private actor LiveTranscriptCoordinator {
     private var openSegmentStarts: [LiveTrack: TimeInterval] = [:]
     private var finished: Set<LiveTrack> = []
     private var pending: [PendingSegment] = []
+    private var turnAssembler = TranscriptTurnAssembler()
 
     init(url: URL) {
         writer = LiveTranscriptWriter(url: url)
@@ -301,12 +359,18 @@ private actor LiveTranscriptCoordinator {
         for segment in ready {
             guard let trackStart = starts[segment.track] else { continue }
             let offset = trackStart.timeIntervalSince(origin)
-            await writer.append(
+            let completed = turnAssembler.append(SpeakerTranscriptSegment(
                 speaker: segment.track.speaker,
                 start: offset + segment.relativeStart,
                 end: offset + segment.relativeEnd,
                 text: segment.text
-            )
+            ))
+            for turn in completed {
+                await writer.append(turn)
+            }
+        }
+        if let completed = turnAssembler.advance(to: safeThrough) {
+            await writer.append(completed)
         }
     }
 
@@ -335,15 +399,9 @@ private actor LiveTranscriptWriter {
         try appendData(Data())
     }
 
-    func append(speaker: String, start: TimeInterval, end: TimeInterval, text: String) {
+    func append(_ turn: TranscriptTurn) {
         guard failure == nil else { return }
-        let singleLine = text
-            .split(whereSeparator: \Character.isWhitespace)
-            .joined(separator: " ")
-        guard !singleLine.isEmpty else { return }
-
-        let clock = "[\(Self.clock(start))–\(Self.clock(max(start, end)))]"
-        let paragraph = "**\(clock) \(speaker):** \(singleLine)\n\n"
+        let paragraph = "\(TranscriptTurnMarkdown.block(turn))\n\n"
         do {
             try appendData(Data(paragraph.utf8))
         } catch {
@@ -380,13 +438,5 @@ private actor LiveTranscriptWriter {
                 written += count
             }
         }
-    }
-
-    private static func clock(_ interval: TimeInterval) -> String {
-        let total = max(0, Int(interval))
-        let h = total / 3600, m = (total % 3600) / 60, s = total % 60
-        return h > 0
-            ? String(format: "%d:%02d:%02d", h, m, s)
-            : String(format: "%d:%02d", m, s)
     }
 }
