@@ -1,0 +1,89 @@
+{
+  "baseline": {
+    "legacy_utterances": 579,
+    "words": 8125,
+    "turns": 1397,
+    "one_word_turns": 576,
+    "forced_windows": 155,
+    "window_only_turn_boundaries": 397
+  },
+  "fixtures": [
+    {
+      "id": "forced-overlap-a",
+      "kind": "forced_overlap",
+      "start_seconds": 1598.620,
+      "end_seconds": 1613.500,
+      "tracks": ["system"]
+    },
+    {
+      "id": "forced-overlap-b",
+      "kind": "forced_overlap",
+      "start_seconds": 2682.140,
+      "end_seconds": 2698.000,
+      "tracks": ["system"]
+    },
+    {
+      "id": "forced-overlap-c",
+      "kind": "forced_overlap",
+      "start_seconds": 3593.116,
+      "end_seconds": 3608.000,
+      "tracks": ["system"]
+    },
+    {
+      "id": "quiet-tail-a",
+      "kind": "silence",
+      "start_seconds": 3964.000,
+      "end_seconds": 3967.500,
+      "tracks": ["mic"]
+    },
+    {
+      "id": "quiet-tail-b",
+      "kind": "silence",
+      "start_seconds": 3968.000,
+      "end_seconds": 3971.500,
+      "tracks": ["mic"]
+    },
+    {
+      "id": "quiet-tail-c",
+      "kind": "silence",
+      "start_seconds": 3977.500,
+      "end_seconds": 3981.000,
+      "tracks": ["mic"]
+    },
+    {
+      "id": "quiet-tail-d",
+      "kind": "silence",
+      "start_seconds": 3987.500,
+      "end_seconds": 3991.000,
+      "tracks": ["mic"]
+    },
+    {
+      "id": "quiet-tail-e",
+      "kind": "silence",
+      "start_seconds": 3993.500,
+      "end_seconds": 3997.000,
+      "tracks": ["mic"]
+    },
+    {
+      "id": "quiet-tail-f",
+      "kind": "silence",
+      "start_seconds": 4020.500,
+      "end_seconds": 4024.000,
+      "tracks": ["mic"]
+    },
+    {
+      "id": "short-speech-control",
+      "kind": "speech",
+      "start_seconds": 788.500,
+      "end_seconds": 795.000,
+      "tracks": ["mic", "system"]
+    },
+    {
+      "id": "cross-track-control",
+      "kind": "cross_track",
+      "start_seconds": 1042.000,
+      "end_seconds": 1058.000,
+      "tracks": ["mic", "system"]
+    }
+  ]
+}

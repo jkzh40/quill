@@ -4,7 +4,7 @@ import Foundation
 ///
 ///     {
 ///       "recordings_dir": "~/Recordings",
-///       "transcription": { "enabled": true, "engine": "parakeet" },
+///       "transcription": { "enabled": true },
 ///       "mic_voice_processing": true,
 ///       "on_stop": "my-hook"
 ///     }
@@ -33,15 +33,9 @@ enum Config {
         return cmd
     }
 
-    /// Whether finished recordings are transcribed automatically. Default on.
+    /// Whether recordings are transcribed live. Default on.
     static func transcriptionEnabled() -> Bool {
         transcription()?["enabled"] as? Bool ?? true
-    }
-
-    /// Configured engine name. Only "parakeet" ships today; the coordinator
-    /// warns and falls back for anything else.
-    static func transcriptionEngine() -> String {
-        transcription()?["engine"] as? String ?? "parakeet"
     }
 
     private static func transcription() -> [String: Any]? {

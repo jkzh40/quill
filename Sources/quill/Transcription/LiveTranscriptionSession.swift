@@ -3,13 +3,13 @@ import Darwin
 import FluidAudio
 import Foundation
 
-/// A deep copy of a recorder callback buffer. AVFoundation reuses its callback
-/// buffers, so the original must never cross into an asynchronous transcriber.
+/// A deep copy of a recorder callback buffer. AVFoundation and Core Audio
+/// reuse callback memory, so the original must not cross an async boundary.
 struct CapturedAudioBuffer: @unchecked Sendable {
     let pcm: AVAudioPCMBuffer
     let capturedAt: Date
 
-    init?(copying source: AVAudioPCMBuffer) {
+    init?(copying source: AVAudioPCMBuffer, capturedAt: Date = Date()) {
         guard let copy = AVAudioPCMBuffer(
             pcmFormat: source.format,
             frameCapacity: source.frameLength
@@ -32,80 +32,148 @@ struct CapturedAudioBuffer: @unchecked Sendable {
             destinationBuffers[index].mDataByteSize = sourceBuffer.mDataByteSize
         }
         pcm = copy
-        capturedAt = Date()
+        self.capturedAt = capturedAt
     }
 }
 
 typealias AudioBufferHandler = @Sendable (CapturedAudioBuffer) -> Void
 
-private enum LiveTrack: CaseIterable, Hashable, Sendable {
-    case mic
-    case system
+/// Models shared by the two track processors. LS-EEND serializes predictions
+/// inside its model wrapper, so two streaming sessions can safely share the
+/// expensive Core ML object while retaining independent recurrent state.
+struct LiveTranscriptionResources: @unchecked Sendable {
+    let asrModels: AsrModels
+    let vad: VadManager
+    let diarizerModel: LSEENDModel?
 
-    var speaker: String {
-        switch self {
-        case .mic: return "me"
-        case .system: return "them"
+    var provenance: TranscriptDocument.Models {
+        TranscriptDocument.Models(
+            asr: "parakeet-tdt-0.6b-v2-coreml",
+            vad: "silero-vad-unified-256ms-v6.2.1",
+            diarizer: diarizerModel == nil ? "disabled" : "ls-eend-dihard3-100ms-coreml"
+        )
+    }
+
+    static func prepare(includeDiarization: Bool = true) async throws -> LiveTranscriptionResources {
+        async let asr = ParakeetModelLoader.loadV2()
+        async let vad = VadManager(config: VadConfig(defaultThreshold: 0.5))
+        let diarizer: LSEENDModel?
+        if includeDiarization {
+            diarizer = try await LSEENDModel.loadFromHuggingFace(
+                variant: .dihard3,
+                stepSize: .step100ms
+            )
+        } else {
+            diarizer = nil
         }
+        return try await LiveTranscriptionResources(
+            asrModels: asr,
+            vad: vad,
+            diarizerModel: diarizer
+        )
     }
 }
 
-/// Runs two streaming Parakeet decoders over the same buffers that are being
-/// recorded to disk. Updates are serialized through one append-only writer;
-/// the normal post-recording transcript remains separate and canonical.
-actor LiveTranscriptionSession {
-    private static let chunkSeconds: TimeInterval = 11
+private struct SpeechClip: Sendable {
+    let id: String
+    let episodeID: String
+    let track: TranscriptTrackID
+    let startSample: Int
+    let endSample: Int
+    let samples: [Float]
+    let forcedSplit: Bool
 
-    private let output: LiveTranscriptCoordinator
+    var startTime: TimeInterval { TimeInterval(startSample) / 16_000 }
+    var endTime: TimeInterval { TimeInterval(endSample) / 16_000 }
+}
+
+private final class SendableDiarizer: @unchecked Sendable {
+    let value: LSEENDDiarizer
+
+    init(_ value: LSEENDDiarizer) {
+        self.value = value
+    }
+}
+
+/// The live CLI pipeline. Each track has independent VAD and diarization state;
+/// completed speech clips share one
+/// serial, backpressured Parakeet worker so Core ML inference cannot race or
+/// accumulate an unbounded recovery queue.
+actor LiveTranscriptionSession {
+    private let store: TranscriptStore
+    private let stdout: TentativeTranscriptWriter?
+    private let resources: LiveTranscriptionResources
+    private let startedAt: Date
+
     private let micBuffers: AsyncStream<CapturedAudioBuffer>
     private let systemBuffers: AsyncStream<CapturedAudioBuffer>
     nonisolated private let micContinuation: AsyncStream<CapturedAudioBuffer>.Continuation
     nonisolated private let systemContinuation: AsyncStream<CapturedAudioBuffer>.Continuation
 
-    private var micManager: SlidingWindowAsrManager?
-    private var systemManager: SlidingWindowAsrManager?
+    private var micProcessor: LiveTrackProcessor?
+    private var systemProcessor: LiveTrackProcessor?
+    private var transcriber: SpeechClipTranscriber?
     private var micInputTask: Task<Void, Never>?
     private var systemInputTask: Task<Void, Never>?
-    private var micOutputTask: Task<Void, Never>?
-    private var systemOutputTask: Task<Void, Never>?
+    private var trackStarts: [TranscriptTrackID: Date] = [:]
+    private var offsetsAreFixed = false
 
-    init(output: URL) {
-        self.output = LiveTranscriptCoordinator(url: output)
+    init(
+        sessionDir: URL,
+        startedAt: Date,
+        resources: LiveTranscriptionResources,
+        standardOutputDescriptor: Int32? = nil,
+        transcriptURL: URL? = nil,
+        initialStatus: TranscriptLifecycle = .recording
+    ) {
+        self.resources = resources
+        self.startedAt = startedAt
+        store = TranscriptStore(
+            url: transcriptURL ?? sessionDir.appendingPathComponent("transcript.json"),
+            sessionID: sessionDir.lastPathComponent,
+            startedAt: startedAt,
+            models: resources.provenance,
+            status: initialStatus
+        )
+        stdout = standardOutputDescriptor.map(TentativeTranscriptWriter.init(descriptor:))
         (micBuffers, micContinuation) = AsyncStream.makeStream()
         (systemBuffers, systemContinuation) = AsyncStream.makeStream()
     }
 
-    /// Load the already-configured v2 model before capture starts so the first
-    /// words aren't lost while Core ML initializes. Both streams share models.
     func prepare() async throws {
-        try await output.prepare()
-        let models = try await ParakeetModelLoader.loadV2()
-        // The same proven 2 s left + 11 s center + 2 s right context used by
-        // FluidAudio's high-quality sliding-window path. Unlike the previous
-        // five-second low-latency setup, this favors canonical-like output.
-        let config = SlidingWindowAsrConfig.default.applying(
-            tdtConfig: TdtConfig(blankId: AsrModelVersion.v2.blankId)
+        try await store.prepare()
+
+        let micDiarizer = try resources.diarizerModel.map { try LSEENDDiarizer(model: $0) }
+        let systemDiarizer = try resources.diarizerModel.map { try LSEENDDiarizer(model: $0) }
+        let manager = AsrManager()
+        try await manager.loadModels(resources.asrModels)
+        let transcriber = SpeechClipTranscriber(
+            manager: manager,
+            store: store,
+            stdout: stdout
         )
+        self.transcriber = transcriber
+        let mic = LiveTrackProcessor(
+            track: .mic,
+            vad: resources.vad,
+            diarizer: micDiarizer.map(SendableDiarizer.init),
+            store: store,
+            transcriber: transcriber
+        )
+        let system = LiveTrackProcessor(
+            track: .system,
+            vad: resources.vad,
+            diarizer: systemDiarizer.map(SendableDiarizer.init),
+            store: store,
+            transcriber: transcriber
+        )
+        micProcessor = mic
+        systemProcessor = system
 
-        let mic = SlidingWindowAsrManager(config: config)
-        let system = SlidingWindowAsrManager(config: config)
-        try await mic.loadModels(models)
-        try await system.loadModels(models)
-        try await mic.startStreaming(source: .microphone)
-        try await system.startStreaming(source: .system)
-
-        let micUpdates = await mic.transcriptionUpdates
-        let systemUpdates = await system.transcriptionUpdates
-        micOutputTask = outputTask(updates: micUpdates, track: .mic)
-        systemOutputTask = outputTask(updates: systemUpdates, track: .system)
-        micInputTask = inputTask(buffers: micBuffers, manager: mic, track: .mic)
-        systemInputTask = inputTask(buffers: systemBuffers, manager: system, track: .system)
-        micManager = mic
-        systemManager = system
+        micInputTask = inputTask(stream: micBuffers, track: .mic, processor: mic)
+        systemInputTask = inputTask(stream: systemBuffers, track: .system, processor: system)
     }
 
-    /// These synchronous entry points are safe in audio callbacks: AsyncStream
-    /// continuations are thread-safe and preserve each track's yield order.
     nonisolated func receiveMic(_ buffer: CapturedAudioBuffer) {
         micContinuation.yield(buffer)
     }
@@ -114,329 +182,699 @@ actor LiveTranscriptionSession {
         systemContinuation.yield(buffer)
     }
 
-    /// Drain every captured buffer, flush each decoder's final partial chunk,
-    /// then close the update streams only after their appended output is read.
+    func configureTrackOffsets(micMs: Int, systemMs: Int) async {
+        offsetsAreFixed = true
+        await store.setTrackOffsets([.mic: micMs, .system: systemMs])
+    }
+
+    /// Replay recorded CAF tracks through the identical live pipeline. This is
+    /// used for crash recovery and intentionally writes no stdout output.
+    func replay(
+        mic: URL?,
+        system: URL?,
+        from start: TimeInterval = 0,
+        to end: TimeInterval? = nil
+    ) async throws {
+        var firstFailure: Error?
+        if let mic, let micProcessor {
+            do { try await replayFile(mic, from: start, to: end, through: micProcessor) } catch {
+                firstFailure = error
+                await store.recordFailure(component: "recovery:mic", error: error)
+            }
+        }
+        if let system, let systemProcessor {
+            do { try await replayFile(system, from: start, to: end, through: systemProcessor) } catch {
+                if firstFailure == nil { firstFailure = error }
+                await store.recordFailure(component: "recovery:system", error: error)
+            }
+        }
+        if let firstFailure { throw firstFailure }
+    }
+
     func finish() async throws {
+        try await store.setStatus(.finalizing)
         micContinuation.finish()
         systemContinuation.finish()
         await micInputTask?.value
         await systemInputTask?.value
 
-        guard let micManager, let systemManager else { return }
-        let micFinish = Task { try await micManager.finish() }
-        let systemFinish = Task { try await systemManager.finish() }
-
-        var transcriptionFailure: Error?
-        do { _ = try await micFinish.value } catch { transcriptionFailure = error }
-        do { _ = try await systemFinish.value } catch {
-            if transcriptionFailure == nil { transcriptionFailure = error }
+        var firstFailure: Error?
+        if let micProcessor {
+            do { try await micProcessor.finish() } catch { firstFailure = error }
+        }
+        if let systemProcessor {
+            do { try await systemProcessor.finish() } catch {
+                if firstFailure == nil { firstFailure = error }
+            }
+        }
+        if let transcriber {
+            do { try await transcriber.finish() } catch {
+                if firstFailure == nil { firstFailure = error }
+            }
         }
 
-        await micManager.cancel()
-        await systemManager.cancel()
-        await micOutputTask?.value
-        await systemOutputTask?.value
-        await micManager.cleanup()
-        await systemManager.cleanup()
+        try await store.finish()
+        if let firstFailure { throw firstFailure }
+        try await store.checkForFailure()
+    }
 
-        try await output.checkForFailure()
-        if let transcriptionFailure { throw transcriptionFailure }
+    func markInterrupted() async {
+        try? await store.setStatus(.interrupted)
+    }
+
+    func currentDocument() async -> TranscriptDocument {
+        await store.currentDocument()
     }
 
     private func inputTask(
-        buffers: AsyncStream<CapturedAudioBuffer>,
-        manager: SlidingWindowAsrManager,
-        track: LiveTrack
+        stream: AsyncStream<CapturedAudioBuffer>,
+        track: TranscriptTrackID,
+        processor: LiveTrackProcessor
     ) -> Task<Void, Never> {
-        Task { [output] in
+        Task { [weak self] in
             var first = true
-            for await buffer in buffers {
+            for await buffer in stream {
                 if first {
-                    await output.noteStart(of: track, at: buffer.capturedAt)
+                    await self?.noteTrackStart(track, at: buffer.capturedAt)
                     first = false
                 }
-                await manager.streamAudio(buffer.pcm)
+                await processor.receive(buffer)
             }
         }
     }
 
-    private func outputTask(
-        updates: AsyncStream<SlidingWindowTranscriptionUpdate>,
-        track: LiveTrack
-    ) -> Task<Void, Never> {
-        Task { [output] in
-            var reconciler = LiveWordReconciler()
-            var segmenter = IncrementalTranscriptSegmenter()
-            var processedWindows = 0
-            for await update in updates {
-                processedWindows += 1
-                let decoded = buildWordTimings(from: update.tokenTimings)
-                let segments = segmenter.append(reconciler.accept(decoded))
-                await output.receive(
-                    segments,
-                    from: track,
-                    processedThrough: TimeInterval(processedWindows) * Self.chunkSeconds,
-                    openSegmentStart: segmenter.openStart
-                )
+    private func noteTrackStart(_ track: TranscriptTrackID, at date: Date) async {
+        guard !offsetsAreFixed, trackStarts[track] == nil else { return }
+        trackStarts[track] = date
+        let origin = trackStarts.values.min() ?? date
+        var offsets: [TranscriptTrackID: Int] = [:]
+        for candidate in TranscriptTrackID.allCases {
+            let start = trackStarts[candidate] ?? origin
+            offsets[candidate] = Int((start.timeIntervalSince(origin) * 1000).rounded())
+        }
+        await store.setTrackOffsets(offsets)
+    }
+
+    private func replayFile(
+        _ url: URL,
+        from start: TimeInterval,
+        to end: TimeInterval?,
+        through processor: LiveTrackProcessor
+    ) async throws {
+        let file = try AVAudioFile(forReading: url)
+        let format = file.processingFormat
+        let firstFrame = min(file.length, max(0, AVAudioFramePosition(start * format.sampleRate)))
+        let lastFrame = end.map {
+            min(file.length, max(firstFrame, AVAudioFramePosition($0 * format.sampleRate)))
+        } ?? file.length
+        file.framePosition = firstFrame
+        let framesPerRead = AVAudioFrameCount(max(4096, Int(format.sampleRate / 4)))
+        while file.framePosition < lastFrame {
+            try Task.checkCancellation()
+            let count = AVAudioFrameCount(min(Int64(framesPerRead), lastFrame - file.framePosition))
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: count) else {
+                throw CocoaError(.fileReadCorruptFile)
             }
-            if let final = segmenter.finish() {
-                await output.receive(
-                    [final],
-                    from: track,
-                    processedThrough: TimeInterval(processedWindows) * Self.chunkSeconds,
-                    openSegmentStart: nil
-                )
-            }
-            await output.finish(track)
+            try file.read(into: buffer, frameCount: count)
+            guard buffer.frameLength > 0,
+                  let captured = CapturedAudioBuffer(copying: buffer, capturedAt: startedAt)
+            else { break }
+            await processor.receive(captured)
         }
     }
 }
 
-/// Suppresses only duplicate words that refer to the same moment in the audio.
-/// FluidAudio already reconciles token IDs across most sliding-window seams;
-/// this timing check covers residual updates without guessing whether a spoken
-/// repetition at a later timestamp was intentional.
-struct LiveWordReconciler {
-    private static let historySeconds: TimeInterval = 5
+private actor SpeechClipTranscriber {
+    private let manager: AsrManager
+    private let store: TranscriptStore
+    private let stdout: TentativeTranscriptWriter?
+    private var reconcilers: [TranscriptTrackID: LiveWordReconciler] = [:]
+    private var firstFailure: Error?
 
-    private var recent: [WordTiming] = []
-    private var latestEnd: TimeInterval = 0
+    init(
+        manager: AsrManager,
+        store: TranscriptStore,
+        stdout: TentativeTranscriptWriter?
+    ) {
+        self.manager = manager
+        self.store = store
+        self.stdout = stdout
+    }
 
-    mutating func accept(_ words: [WordTiming]) -> [WordTiming] {
-        var accepted: [WordTiming] = []
-        for word in words.sorted(by: Self.isEarlier) {
-            let candidates = recent + accepted
-            guard !candidates.contains(where: { Self.isSameTimedWord($0, word) }) else {
-                continue
+    func process(_ clip: SpeechClip) async {
+        do {
+            var decoderState = try TdtDecoderState()
+            let result = try await manager.transcribe(
+                clip.samples,
+                decoderState: &decoderState
+            )
+            var reconciler = reconcilers[clip.track] ?? LiveWordReconciler()
+            let evaluation = ASRAcceptancePolicy.evaluate(
+                result,
+                startingAt: clip.startTime,
+                reconciler: &reconciler
+            )
+            reconcilers[clip.track] = reconciler
+            guard evaluation.status == .accepted else {
+                await store.completeProcessingWindow(
+                    id: clip.id,
+                    status: evaluation.status,
+                    confidence: result.confidence,
+                    hypothesis: evaluation.hypothesis
+                )
+                return
             }
-            accepted.append(word)
-            latestEnd = max(latestEnd, word.endTime)
-        }
 
-        recent += accepted
-        let cutoff = latestEnd - Self.historySeconds
-        recent.removeAll { $0.endTime < cutoff }
-        return accepted
-    }
-
-    private static func isEarlier(_ lhs: WordTiming, _ rhs: WordTiming) -> Bool {
-        if lhs.startTime != rhs.startTime { return lhs.startTime < rhs.startTime }
-        return lhs.endTime < rhs.endTime
-    }
-
-    private static func isSameTimedWord(_ lhs: WordTiming, _ rhs: WordTiming) -> Bool {
-        guard normalized(lhs.word) == normalized(rhs.word) else { return false }
-        let overlap = min(lhs.endTime, rhs.endTime) - max(lhs.startTime, rhs.startTime)
-        let shorterDuration = min(
-            max(0, lhs.endTime - lhs.startTime),
-            max(0, rhs.endTime - rhs.startTime)
-        )
-        if shorterDuration > 0, overlap / shorterDuration >= 0.5 { return true }
-
-        // Very short punctuation timings can shift by a frame and have too
-        // little duration for a useful overlap ratio.
-        return shorterDuration <= 0.05
-            && abs(lhs.startTime - rhs.startTime) <= 0.05
-    }
-
-    private static func normalized(_ word: String) -> String {
-        let folded = word.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
-        let scalars = folded.unicodeScalars.filter(CharacterSet.alphanumerics.contains)
-        if !scalars.isEmpty { return String(String.UnicodeScalarView(scalars)) }
-        return folded.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-}
-
-/// Holds completed segments until both decoders have advanced far enough that
-/// no earlier segment can still arrive. Track-relative model timestamps are
-/// shifted onto the same clock using the first captured buffer from each track.
-private actor LiveTranscriptCoordinator {
-    private struct PendingSegment {
-        let track: LiveTrack
-        let relativeStart: TimeInterval
-        let relativeEnd: TimeInterval
-        let text: String
-    }
-
-    private let writer: LiveTranscriptWriter
-    private var starts: [LiveTrack: Date] = [:]
-    private var processedThrough: [LiveTrack: TimeInterval] = [:]
-    private var openSegmentStarts: [LiveTrack: TimeInterval] = [:]
-    private var finished: Set<LiveTrack> = []
-    private var pending: [PendingSegment] = []
-    private var turnAssembler = TranscriptTurnAssembler()
-
-    init(url: URL) {
-        writer = LiveTranscriptWriter(url: url)
-    }
-
-    func prepare() async throws {
-        try await writer.prepare()
-    }
-
-    func noteStart(of track: LiveTrack, at date: Date) async {
-        if starts[track] == nil { starts[track] = date }
-        await flushReady()
-    }
-
-    func receive(
-        _ segments: [TranscriptSegment],
-        from track: LiveTrack,
-        processedThrough newProgress: TimeInterval,
-        openSegmentStart: TimeInterval?
-    ) async {
-        pending += segments.map {
-            PendingSegment(
-                track: track,
-                relativeStart: $0.start,
-                relativeEnd: $0.end,
-                text: $0.text
+            let wordIDs = await store.completeProcessingWindow(
+                id: clip.id,
+                status: .accepted,
+                confidence: result.confidence,
+                hypothesis: evaluation.hypothesis,
+                words: evaluation.words.map {
+                    TranscriptStore.TimedWord(
+                        text: $0.text,
+                        start: $0.start,
+                        end: $0.end,
+                        confidence: $0.confidence
+                    )
+                }
+            )
+            if let stdout {
+                await stdout.write(await store.previewTurns(forWordIDs: wordIDs))
+            }
+        } catch {
+            if firstFailure == nil { firstFailure = error }
+            await store.completeProcessingWindow(
+                id: clip.id,
+                status: .failed,
+                confidence: nil,
+                hypothesis: nil
+            )
+            await store.recordFailure(
+                component: "asr:\(clip.track.rawValue)",
+                error: error
             )
         }
-        processedThrough[track] = max(processedThrough[track] ?? 0, newProgress)
-        if let openSegmentStart {
-            openSegmentStarts[track] = openSegmentStart
-        } else {
-            openSegmentStarts.removeValue(forKey: track)
-        }
-        await flushReady()
     }
 
-    func finish(_ track: LiveTrack) async {
-        if starts[track] == nil {
-            starts[track] = starts.values.min() ?? Date()
-        }
-        openSegmentStarts.removeValue(forKey: track)
-        finished.insert(track)
-        await flushReady()
-    }
-
-    func checkForFailure() async throws {
-        try await writer.checkForFailure()
-    }
-
-    private func flushReady() async {
-        guard let origin = starts.values.min(), starts.count == LiveTrack.allCases.count else {
-            return
-        }
-
-        let safeThrough: TimeInterval
-        if finished.count == LiveTrack.allCases.count {
-            safeThrough = .infinity
-        } else {
-            var watermarks: [TimeInterval] = []
-            for track in LiveTrack.allCases {
-                if finished.contains(track) {
-                    watermarks.append(.infinity)
-                    continue
-                }
-                guard let progress = processedThrough[track], let start = starts[track] else {
-                    return
-                }
-                let relativeSafe = min(progress, openSegmentStarts[track] ?? .infinity)
-                watermarks.append(start.timeIntervalSince(origin) + relativeSafe)
-            }
-            safeThrough = watermarks.min() ?? 0
-        }
-
-        var ready: [PendingSegment] = []
-        var waiting: [PendingSegment] = []
-        for segment in pending {
-            if alignedStart(of: segment, origin: origin) <= safeThrough {
-                ready.append(segment)
-            } else {
-                waiting.append(segment)
-            }
-        }
-        pending = waiting
-        ready.sort {
-            let lhs = alignedStart(of: $0, origin: origin)
-            let rhs = alignedStart(of: $1, origin: origin)
-            if lhs != rhs { return lhs < rhs }
-            return $0.track.speaker < $1.track.speaker
-        }
-
-        for segment in ready {
-            guard let trackStart = starts[segment.track] else { continue }
-            let offset = trackStart.timeIntervalSince(origin)
-            let completed = turnAssembler.append(SpeakerTranscriptSegment(
-                speaker: segment.track.speaker,
-                start: offset + segment.relativeStart,
-                end: offset + segment.relativeEnd,
-                text: segment.text
-            ))
-            for turn in completed {
-                await writer.append(turn)
-            }
-        }
-        if let completed = turnAssembler.advance(to: safeThrough) {
-            await writer.append(completed)
-        }
-    }
-
-    private func alignedStart(of segment: PendingSegment, origin: Date) -> TimeInterval {
-        guard let trackStart = starts[segment.track] else { return .infinity }
-        return trackStart.timeIntervalSince(origin) + segment.relativeStart
+    func finish() async throws {
+        await manager.cleanup()
+        if let firstFailure { throw firstFailure }
     }
 }
 
-/// Appends complete Markdown paragraphs without ever reading or rewriting the
-/// destination. The path is reopened for every chunk with O_APPEND so editor
-/// changes are ignored and the next chunk targets the file currently at path.
-private actor LiveTranscriptWriter {
-    private let url: URL
+private actor LiveTrackProcessor {
+    private static let sampleRate = 16_000
+    private static let vadChunkSamples = 4096
+    private static let maxClipSamples = TranscriptionDefaults.processingWindowMs * sampleRate / 1_000
+    private static let overlapSamples = TranscriptionDefaults.processingOverlapMs * sampleRate / 1_000
+    private static let inactiveHistorySamples = sampleRate
+    private static let minimumSpeechSamples = Int(0.3 * Double(sampleRate))
+
+    private let track: TranscriptTrackID
+    private let vad: VadManager
+    private let diarizer: SendableDiarizer?
+    private let store: TranscriptStore
+    private let transcriber: SpeechClipTranscriber
+    private let converter = DurationCorrectingAudioConverter()
+    private let segmentation = VadSegmentationConfig(
+        minSpeechDuration: 0.3,
+        minSilenceDuration: 0.75,
+        maxSpeechDuration: .infinity,
+        speechPadding: 0.1,
+        silenceThresholdForSplit: 0.35,
+        negativeThreshold: 0.35,
+        negativeThresholdOffset: 0.15,
+        minSilenceAtMaxSpeech: 0.098,
+        useMaxPossibleSilenceAtMaxSpeech: true
+    )
+
+    private var vadState = VadStreamState.initial()
+    private var pendingVAD: [Float] = []
+    private var ring: [Float] = []
+    private var ringStartSample = 0
+    private var totalSamples = 0
+    private var episodeID: String?
+    private var episodeStartSample: Int?
+    private var windowStartSample: Int?
     private var failure: Error?
 
-    init(url: URL) {
-        self.url = url
+    init(
+        track: TranscriptTrackID,
+        vad: VadManager,
+        diarizer: SendableDiarizer?,
+        store: TranscriptStore,
+        transcriber: SpeechClipTranscriber
+    ) {
+        self.track = track
+        self.vad = vad
+        self.diarizer = diarizer
+        self.store = store
+        self.transcriber = transcriber
     }
 
-    func prepare() throws {
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try appendData(Data())
-    }
-
-    func append(_ turn: TranscriptTurn) {
+    func receive(_ buffer: CapturedAudioBuffer) async {
         guard failure == nil else { return }
-        let paragraph = "\(TranscriptTurnMarkdown.block(turn))\n\n"
         do {
-            try appendData(Data(paragraph.utf8))
+            let samples = try converter.convert(buffer.pcm)
+            guard !samples.isEmpty else { return }
+            ring.append(contentsOf: samples)
+            totalSamples += samples.count
+
+            if let diarizer, let update = try diarizer.value.process(
+                samples: samples,
+                sourceSampleRate: Double(Self.sampleRate)
+            ) {
+                await publishDiarization(update)
+            }
+
+            if let episodeID {
+                await store.advanceEpisode(id: episodeID, through: sampleTime(totalSamples))
+            }
+
+            pendingVAD.append(contentsOf: samples)
+            while pendingVAD.count >= Self.vadChunkSamples {
+                let chunk = Array(pendingVAD.prefix(Self.vadChunkSamples))
+                pendingVAD.removeFirst(Self.vadChunkSamples)
+                try await processVAD(chunk)
+            }
+            trimRing()
         } catch {
             failure = error
-            FileHandle.standardError.write(Data(
-                "live transcript write failed: \(error)\n".utf8
-            ))
+            await store.recordFailure(component: "live:\(track.rawValue)", error: error)
         }
     }
 
-    func checkForFailure() throws {
+    func finish() async throws {
+        defer { diarizer?.value.cleanup() }
+        if failure == nil, !pendingVAD.isEmpty {
+            do {
+                let tail = pendingVAD
+                pendingVAD.removeAll()
+                try await processVAD(tail)
+            } catch {
+                failure = error
+                await store.recordFailure(component: "vad:\(track.rawValue)", error: error)
+            }
+        }
+
+        if failure == nil,
+           let episodeID,
+           let windowStartSample
+        {
+            await emitClip(
+                episodeID: episodeID,
+                start: windowStartSample,
+                end: totalSamples,
+                forced: false
+            )
+            await store.finishEpisode(id: episodeID, at: sampleTime(totalSamples))
+            clearEpisode()
+        }
+
+        if failure == nil, let diarizer {
+            do {
+                _ = try diarizer.value.finalizeSession()
+                let timeline = diarizer.value.timeline
+                let spans = timeline.speakers.values.flatMap { speaker in
+                    speaker.finalizedSegments.map(Self.span)
+                }
+                await store.replaceDiarization(
+                    track: track,
+                    finalized: spans,
+                    finalizedThrough: TimeInterval(timeline.duration)
+                )
+            } catch {
+                failure = error
+                await store.recordFailure(component: "diarization:\(track.rawValue)", error: error)
+            }
+        }
         if let failure { throw failure }
     }
 
-    private func appendData(_ data: Data) throws {
-        let descriptor = Darwin.open(url.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
-        guard descriptor >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
-        defer { Darwin.close(descriptor) }
-        guard !data.isEmpty else { return }
+    private func processVAD(_ chunk: [Float]) async throws {
+        let result = try await vad.processStreamingChunk(
+            chunk,
+            state: vadState,
+            config: segmentation
+        )
+        vadState = result.state
+        if let event = result.event {
+            switch event.kind {
+            case .speechStart:
+                if episodeID == nil {
+                    let id = UUID().uuidString
+                    episodeID = id
+                    episodeStartSample = event.sampleIndex
+                    windowStartSample = event.sampleIndex
+                    await store.beginEpisode(
+                        id: id,
+                        track: track,
+                        start: sampleTime(event.sampleIndex)
+                    )
+                }
+            case .speechEnd:
+                if let episodeID, let windowStartSample {
+                    await emitClip(
+                        episodeID: episodeID,
+                        start: windowStartSample,
+                        end: event.sampleIndex,
+                        forced: false
+                    )
+                    await store.finishEpisode(id: episodeID, at: sampleTime(event.sampleIndex))
+                }
+                clearEpisode()
+            }
+        }
 
+        while let episodeID,
+              let start = windowStartSample,
+              vadState.processedSamples - start >= Self.maxClipSamples
+        {
+            let end = start + Self.maxClipSamples
+            await emitClip(episodeID: episodeID, start: start, end: end, forced: true)
+            windowStartSample = end - Self.overlapSamples
+            await store.advanceEpisode(id: episodeID, through: sampleTime(end))
+        }
+    }
+
+    private func emitClip(
+        episodeID: String,
+        start requestedStart: Int,
+        end requestedEnd: Int,
+        forced: Bool
+    ) async {
+        let start = max(requestedStart, ringStartSample)
+        let end = min(max(start, requestedEnd), ringStartSample + ring.count)
+        guard end - start >= Self.minimumSpeechSamples else { return }
+        let lower = start - ringStartSample
+        let upper = end - ringStartSample
+        guard lower >= 0, upper <= ring.count, lower < upper else { return }
+
+        let clip = SpeechClip(
+            id: UUID().uuidString,
+            episodeID: episodeID,
+            track: track,
+            startSample: start,
+            endSample: end,
+            samples: Array(ring[lower..<upper]),
+            forcedSplit: forced
+        )
+        await store.addProcessingWindow(
+            id: clip.id,
+            episodeID: episodeID,
+            track: track,
+            start: clip.startTime,
+            end: clip.endTime,
+            forcedSplit: forced
+        )
+        await transcriber.process(clip)
+    }
+
+    private func publishDiarization(_ update: DiarizerTimelineUpdate) async {
+        guard let diarizer else { return }
+        let finalized = update.finalizedSegments.map(Self.span)
+        let tentative = update.tentativeSegments.map(Self.span)
+        let endFrame = update.chunkResult.startFrame + update.chunkResult.finalizedFrameCount
+        let seconds = TimeInterval(Float(endFrame) * diarizer.value.timeline.config.frameDurationSeconds)
+        await store.applyDiarization(
+            track: track,
+            finalized: finalized,
+            tentative: tentative,
+            finalizedThrough: seconds
+        )
+    }
+
+    private func trimRing() {
+        let keepFrom = windowStartSample ?? max(0, totalSamples - Self.inactiveHistorySamples)
+        let drop = max(0, keepFrom - ringStartSample)
+        guard drop > 0 else { return }
+        let actual = min(drop, ring.count)
+        ring.removeFirst(actual)
+        ringStartSample += actual
+    }
+
+    private func clearEpisode() {
+        episodeID = nil
+        episodeStartSample = nil
+        windowStartSample = nil
+    }
+
+    private func sampleTime(_ sample: Int) -> TimeInterval {
+        TimeInterval(sample) / TimeInterval(Self.sampleRate)
+    }
+
+    private static func span(_ segment: DiarizerSegment) -> TranscriptStore.DiarizationSpan {
+        TranscriptStore.DiarizationSpan(
+            speakerIndex: segment.speakerIndex,
+            start: TimeInterval(segment.startTime),
+            end: TimeInterval(segment.endTime),
+            state: segment.isFinalized ? .final : .tentative,
+            activity: segment.activity
+        )
+    }
+}
+
+/// Stdout is deliberately best-effort and non-authoritative. Each ASR result
+/// is printed once; later speaker corrections are visible only in JSON.
+private actor TentativeTranscriptWriter {
+    private let descriptor: Int32
+    private var failed = false
+
+    init(descriptor: Int32) {
+        self.descriptor = descriptor
+    }
+
+    func write(_ turns: [TranscriptDocument.Turn]) {
+        guard !failed else { return }
+        for turn in turns {
+            do {
+                try writeAll(Data(TentativeTranscriptLine.render(turn).utf8))
+            } catch {
+                failed = true
+                FileHandle.standardError.write(Data("live stdout failed: \(error)\n".utf8))
+            }
+        }
+    }
+
+    private func writeAll(_ data: Data) throws {
         try data.withUnsafeBytes { bytes in
             guard let base = bytes.baseAddress else { return }
             var written = 0
             while written < bytes.count {
-                let count = Darwin.write(
-                    descriptor,
-                    base.advanced(by: written),
-                    bytes.count - written
-                )
+                let count = Darwin.write(descriptor, base.advanced(by: written), bytes.count - written)
                 if count < 0 {
                     if errno == EINTR { continue }
                     throw POSIXError(.init(rawValue: errno) ?? .EIO)
                 }
+                guard count > 0 else { throw POSIXError(.EIO) }
                 written += count
             }
         }
+    }
+}
+
+enum TentativeTranscriptLine {
+    static func render(_ turn: TranscriptDocument.Turn) -> String {
+        let tentative = turn.speaker_state != .final
+        return "[\(clock(turn.start_ms))–\(clock(turn.end_ms))] "
+            + "\(turn.speaker_id)\(tentative ? "?" : "") \(turn.text)\n"
+    }
+
+    private static func clock(_ milliseconds: Int) -> String {
+        let total = max(0, milliseconds / 1000)
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let seconds = total % 60
+        return hours > 0
+            ? String(format: "%d:%02d:%02d", hours, minutes, seconds)
+            : String(format: "%d:%02d", minutes, seconds)
+    }
+}
+
+/// FluidAudio's one-buffer converter is intentionally stateless. Capture tap
+/// sizes rarely divide evenly into 16 kHz, so independently rounding every
+/// callback can accumulate seconds of timestamp drift over a long meeting.
+/// Correct each result to the cumulative source duration while retaining the
+/// library's format conversion and channel mixing.
+private final class DurationCorrectingAudioConverter: @unchecked Sendable {
+    private let converter = AudioConverter()
+    private var expectedSampleCount: Double = 0
+    private var emittedSampleCount = 0
+
+    func convert(_ buffer: AVAudioPCMBuffer) throws -> [Float] {
+        var converted = try converter.resampleBuffer(buffer)
+        expectedSampleCount += Double(buffer.frameLength) * 16_000 / buffer.format.sampleRate
+        let expectedTotal = Int(expectedSampleCount.rounded())
+        let required = max(0, expectedTotal - emittedSampleCount)
+
+        if converted.count > required {
+            converted.removeLast(converted.count - required)
+        } else if converted.count < required {
+            converted.append(
+                contentsOf: repeatElement(converted.last ?? 0, count: required - converted.count)
+            )
+        }
+        emittedSampleCount += converted.count
+        return converted
+    }
+}
+
+struct RecognizedWord: Equatable, Sendable {
+    let text: String
+    let start: TimeInterval
+    let end: TimeInterval
+    let confidence: Float
+}
+
+struct ASRAcceptance: Equatable, Sendable {
+    let status: TranscriptASRStatus
+    let confidence: Float
+    let hypothesis: String?
+    let words: [RecognizedWord]
+}
+
+enum ASRAcceptancePolicy {
+    static func evaluate(
+        _ result: ASRResult,
+        startingAt offset: TimeInterval,
+        reconciler: inout LiveWordReconciler
+    ) -> ASRAcceptance {
+        let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hypothesis = text.isEmpty ? nil : text
+        if text.isEmpty, result.tokenTimings?.isEmpty != false {
+            return ASRAcceptance(
+                status: .empty,
+                confidence: result.confidence,
+                hypothesis: nil,
+                words: []
+            )
+        }
+        guard result.confidence >= TranscriptionDefaults.minimumASRConfidence else {
+            return ASRAcceptance(
+                status: .lowConfidence,
+                confidence: result.confidence,
+                hypothesis: hypothesis,
+                words: []
+            )
+        }
+        let timed = buildConfidentWordTimings(from: result.tokenTimings ?? []).map {
+            RecognizedWord(
+                text: $0.text,
+                start: offset + $0.start,
+                end: offset + $0.end,
+                confidence: $0.confidence
+            )
+        }
+        guard !timed.isEmpty else {
+            return ASRAcceptance(
+                status: .missingTimings,
+                confidence: result.confidence,
+                hypothesis: hypothesis,
+                words: []
+            )
+        }
+        let accepted = reconciler.accept(timed)
+        return ASRAcceptance(
+            status: accepted.isEmpty ? .duplicatesOnly : .accepted,
+            confidence: result.confidence,
+            hypothesis: hypothesis,
+            words: accepted
+        )
+    }
+}
+
+/// FluidAudio intentionally omits confidence from its public word timing type.
+/// Aggregate the same SentencePiece groups while retaining the mean token
+/// confidence needed by the durable word stream.
+func buildConfidentWordTimings(from tokenTimings: [TokenTiming]) -> [RecognizedWord] {
+    var words: [RecognizedWord] = []
+    var text = ""
+    var start: TimeInterval = 0
+    var end: TimeInterval = 0
+    var confidenceTotal: Float = 0
+    var tokenCount = 0
+
+    func flush() {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, tokenCount > 0 else { return }
+        words.append(RecognizedWord(
+            text: trimmed,
+            start: start,
+            end: end,
+            confidence: confidenceTotal / Float(tokenCount)
+        ))
+    }
+
+    for timing in tokenTimings {
+        let token = timing.token
+        guard !token.isEmpty, token != "<blank>", token != "<pad>" else { continue }
+        let startsNewWord = token.hasPrefix("▁")
+            || token.unicodeScalars.first.map(CharacterSet.whitespacesAndNewlines.contains) == true
+            || text.isEmpty
+        if startsNewWord, !text.isEmpty {
+            flush()
+            text = ""
+            confidenceTotal = 0
+            tokenCount = 0
+        }
+        if startsNewWord {
+            text = String(token.drop(while: { $0 == "▁" || $0.isWhitespace }))
+            start = timing.startTime
+        } else {
+            text += token
+        }
+        end = timing.endTime
+        confidenceTotal += timing.confidence
+        tokenCount += 1
+    }
+    flush()
+    return words
+}
+
+/// Suppresses only identical words referring to the same moment. This handles
+/// the two-second overlap used when VAD force-splits uninterrupted speech.
+struct LiveWordReconciler {
+    private static let historySeconds: TimeInterval = 5
+    private var recent: [RecognizedWord] = []
+    private var latestEnd: TimeInterval = 0
+
+    mutating func accept(_ words: [RecognizedWord]) -> [RecognizedWord] {
+        var accepted: [RecognizedWord] = []
+        for word in words.sorted(by: Self.isEarlier) {
+            let candidates = recent + accepted
+            guard !candidates.contains(where: { Self.isSameTimedWord($0, word) }) else { continue }
+            accepted.append(word)
+            latestEnd = max(latestEnd, word.end)
+        }
+        recent += accepted
+        recent.removeAll { $0.end < latestEnd - Self.historySeconds }
+        return accepted
+    }
+
+    private static func isEarlier(_ lhs: RecognizedWord, _ rhs: RecognizedWord) -> Bool {
+        if lhs.start != rhs.start { return lhs.start < rhs.start }
+        return lhs.end < rhs.end
+    }
+
+    private static func isSameTimedWord(_ lhs: RecognizedWord, _ rhs: RecognizedWord) -> Bool {
+        guard normalized(lhs.text) == normalized(rhs.text) else { return false }
+        let lhsStart = milliseconds(lhs.start)
+        let lhsEnd = milliseconds(lhs.end)
+        let rhsStart = milliseconds(rhs.start)
+        let rhsEnd = milliseconds(rhs.end)
+        let overlap = min(lhsEnd, rhsEnd) - max(lhsStart, rhsStart)
+        let shorter = min(lhsEnd - lhsStart, rhsEnd - rhsStart)
+        if shorter > 0, overlap * 2 >= shorter { return true }
+        return abs(lhsStart - rhsStart) <= 80
+            && abs(lhsEnd - rhsEnd) <= 80
+    }
+
+    private static func normalized(_ word: String) -> String {
+        String(word.lowercased().unicodeScalars.filter(CharacterSet.alphanumerics.contains))
+    }
+
+    private static func milliseconds(_ seconds: TimeInterval) -> Int {
+        Int((seconds * 1_000).rounded())
     }
 }

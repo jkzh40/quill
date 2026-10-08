@@ -1,165 +1,164 @@
 # quill
 
-A minimal, fully local macOS meeting recorder + transcriber. One menu-bar
-click records your mic and all system audio as two separate tracks; when you
-stop, quill transcribes both on-device and writes a speaker-tagged transcript.
-Nothing ever leaves the machine.
+A fully local macOS CLI meeting recorder with live transcription and speaker
+diarization. It records the microphone and system audio as separate tracks,
+while an in-memory actor continuously mirrors the current transcript to JSON.
+Nothing leaves the Mac.
 
-Named for the feather. Sibling of [parrot](https://github.com/digimata/parrot), same skeleton: single
-Swift binary, menu-bar tray, no app bundle.
+Named for the feather. Sibling of
+[parrot](https://github.com/digimata/parrot): one Swift binary and no app
+bundle.
 
 ## Install
 
 ```sh
-cd quill
 swift build -c release
 sudo cp .build/release/quill /usr/local/bin/quill
-quill install --launch-at-login   # optional — runs in the background on login
 ```
 
-**Requires:** macOS 15+ (Core Audio process taps for system audio — no
-virtual device, no kernel extension). Apple Silicon recommended for
-transcription speed.
+Requires macOS 15+ and Apple Silicon. Core Audio process taps capture system
+audio without a virtual device or kernel extension.
 
-## How to use
+## Recording
 
-1. **Run it** (`quill` in a terminal, or the LaunchAgent).
-2. **Click the feather in the menu bar → Start recording.** First use prompts
-   for microphone and System Audio Recording permissions. While recording, the
-   icon turns red with a running elapsed counter, and macOS shows the purple
-   recording indicator.
-3. **Click → Stop recording** when the meeting ends. Transcription starts
-   automatically (the menu shows progress); a notification fires when the
-   transcript is ready.
+Run `quill` to begin recording and press `Ctrl-C` to stop. Before capture
+starts, Quill loads all three speech models; a download or model-load failure
+blocks the recording instead of silently producing an untranscribed meeting.
+Stopping flushes the final speech episode and finalizes speaker assignments.
 
-Each session lands in `~/Recordings/<yyyy.MM.dd-HHmm>/`:
+Each session is stored under `~/Recordings/<yyyy.MM.dd-HHmm>/`:
 
 | File | Contents |
 |---|---|
-| `mic.caf` | your side (default input device, AAC) |
-| `system.caf` | everything the Mac played — the other side of the call (AAC) |
-| `meta.json` | start/end timestamps, duration, per-track start offsets |
-| `transcript.json` | canonical transcript — engine provenance + timed, speaker-tagged segments |
-| `transcript.md` | the same transcript rendered for reading |
-| `transcribe.log` | transcription progress/errors for this session |
+| `mic.caf` | Microphone audio |
+| `system.caf` | Everything played by the Mac |
+| `meta.json` | Lifecycle, timestamps, track files, and start offsets |
+| `transcript.json` | Authoritative live transcript state |
+| `transcribe.log` | Recovery and hook errors, when present |
 
-Two tracks on purpose: speech models do better on clean single-source audio,
-and mic-vs-system is free two-party diarization — `me` vs `them` with no
-speaker-identification model. CAF on purpose: unlike m4a, it needs no
-finalization pass — if the process dies mid-meeting, everything already
-written is still readable.
+There is intentionally no generated Markdown transcript. Consumers should
+read `transcript.json`, whose atomic replacement means they see either the
+previous complete snapshot or the next one, never a partially written file.
 
-## Transcription
+## Live transcription
 
-Built in, on-device, automatic. The default engine is **Parakeet TDT 0.6B v2**
-(English) via [FluidAudio](https://github.com/FluidInference/FluidAudio)'s
-Core ML port — roughly 20 seconds per hour of audio on Apple Silicon. Models
-(~600 MB) download once on first transcription; `quill doctor` tells you
-whether they're already cached so you're never downloading after an important
-meeting.
+The same pipeline handles live recording and interrupted-session recovery:
 
-Each track is transcribed separately, shifted by its start offset so both
-share one clock, and merged by timestamp. Jobs run in a serial queue — you can
-start a new recording while the last one transcribes. Unfinished jobs resume
-on next launch (the filesystem is the queue: a session with `meta.json` but no
-`transcript.json` is pending). Failures append to the session's
-`transcribe.log` and never block later jobs.
+1. FluidAudio converts each track to 16 kHz mono.
+2. Silero VAD opens an acoustic speech episode at probability 0.50 and closes
+   it after probability falls below 0.35 for 750 ms. Regions shorter than 300
+   ms are ignored and receive 100 ms speech padding.
+3. Parakeet TDT 0.6B v2 transcribes 14-second processing windows with two
+   seconds of overlap. These windows never split the containing episode.
+   Results below confidence 0.65 remain as window diagnostics but do not become
+   words; accepted overlap words are reconciled by text and timestamp. Quill
+   never fabricates a full-window word when token timings are missing or every
+   timed word was already seen.
+4. LS-EEND DIHARD3 runs continuously at 100 ms resolution on both tracks.
+   Speaker identities are track-scoped (`mic:speaker-1`,
+   `system:speaker-2`), so Quill does not claim that a voice heard on both
+   tracks is the same person.
+5. `TranscriptStore`, a Swift actor, owns the typed facts. It reprojects words
+   whenever diarization evidence changes and derives turns independently of
+   processing windows. The same speaker can continue across episodes separated
+   by up to two seconds, while another speaker taking the floor starts a new
+   turn. The store atomically writes at most four JSON snapshots per second.
 
-The engine sits behind a small protocol; a Whisper engine (WhisperKit
-large-v3-turbo) is planned as the fallback / re-transcription option.
+Schema v2 contains lifecycle, model and policy provenance, tracks, VAD
+`episodes`, diagnostic `processing_windows`, accepted ASR words, diarization
+spans, speaker candidates, and derived turns. The legacy `utterances` array and
+`utterance_id` fields remain as processing-window compatibility views. Word
+facts are stable; speaker attribution can move from `pending` or `tentative` to
+a corrected final speaker without append-only coordination. Overlapping
+candidates remain available on each word. Completed schema-v1 sessions remain
+readable and are not rewritten automatically.
 
-## Config
-
-Optional, at `~/.config/quill/config.json`:
-
-```json
-{
-  "recordings_dir": "~/Recordings",
-  "transcription": { "enabled": true, "engine": "parakeet" },
-  "on_stop": "my-hook"
-}
-```
-
-- `recordings_dir` — where sessions land. Resolution order: `--out` flag >
-  config > `~/Recordings`.
-- `transcription.enabled` — set `false` to just record.
-- `mic_voice_processing` — Apple's echo cancellation on the mic (default off).
-  Set `true` when recording meetings through the speakers, so playback doesn't
-  bleed into the mic track and get transcribed twice as "me". The trade: while
-  the voice unit is live, macOS ducks other playback slightly (`.min` ducking
-  is configured, but it can't be zeroed). On headphones there's no echo to
-  cancel, so raw capture is the better default.
-- `on_stop` — shell command spawned with the session directory as its
-  argument, **after the transcript is written** (or right after recording if
-  transcription is disabled). Wire it to whatever comes next: summarization,
-  filing, indexing.
+On a clean stop, status becomes `complete`. If Quill exits with a nonterminal
+snapshot, the next invocation replays any readable CAF tracks through the same
+pipeline concurrently with the new recording and waits for recovery before
+exiting. Legacy transcripts with the old `segments` schema are treated as
+already complete.
 
 ## CLI
 
 ```sh
-quill                        # run the menu-bar daemon (^C to quit)
-quill run --out <dir>        # custom recordings root (default ~/Recordings)
-quill record                 # headless: record immediately, stop with ^C
-quill record --out <dir>     # headless with a custom recordings root
-quill record --no-transcribe # skip the canonical post-recording transcript
-quill record --live-transcript <file> # append transcript chunks while recording
-quill doctor                 # check permissions, recordings folder, models
-quill install --launch-at-login
-quill install --uninstall
+quill                       # record; live transcript on stdout; Ctrl-C to stop
+quill --out <dir>           # record under a custom root
+quill --no-transcribe       # audio only; no model load or transcript JSON
+quill record [options]      # equivalent explicit subcommand
+quill doctor                # permissions, output folder, and model caches
 ```
 
-`quill record` creates no application or menu-bar item. It records until
-`Ctrl-C`, stops both tracks cleanly, and waits for transcription to finish
-before exiting. Progress goes to stderr, desktop notifications are suppressed,
-and the completed session directory is printed to stdout. This makes the
-command suitable for scripts that consume the session directory or transcript
-after a successful exit.
+Progress and paths go to stderr. Each accepted processing-window delta is
+printed once to stdout as a tentative convenience stream:
 
-Add `--live-transcript <file>` to append conversational Markdown blocks while
-recording:
-
-```markdown
-### me · 0:12–0:18
-
-I think the first approach is better. It avoids duplicating the state.
-
-### them · 0:19–0:21
-
-That makes sense.
+```text
+[0:12–0:18] system:speaker-2? I think the first approach is better.
 ```
 
-Consecutive sentences from one speaker remain in the same turn. A speaker
-change or two seconds of confirmed silence closes the block. Canonical
-`transcript.md` uses the same turn layout, while `transcript.json` retains its
-more precise segment-level data.
+Later speaker corrections update only `transcript.json`; stdout is deliberately
+not rewritten. Pipe it anywhere a line-oriented preview is useful, while using
+the session JSON for durable processing.
 
-Quill never reads or rewrites the live file: it reopens the current path for
-each append, so existing and simultaneous edits are disregarded. An editor that
-saves by replacing the entire file can still discard unseen appended text; for
-reliable viewing, treat the live transcript as generated/read-only and keep
-personal notes in a separate file. Live transcription uses the cached Parakeet
-v2 models and aligned start/end timestamps across both tracks. It buffers enough
-left/right context for stable decoding and waits for a turn to close before
-appending it, so the display intentionally trails the conversation.
+## Local structural regression
+
+The model-backed regression suite is opt-in and never runs in CI. It seeks
+directly into a local session's CAF files; no meeting audio or transcript text
+is committed or copied into the repository:
+
+```sh
+QUILL_REGRESSION_SESSION="/path/to/session" \
+  swift test --filter LocalSessionRegression.curatedStructuralFixtures
+```
+
+The curated suite checks forced-window duplication, quiet-tail false positives,
+short genuine speech, cross-track input, episode/window provenance, and turn
+fragmentation. Aggregate JSON and Markdown reports are written under
+`.build/quill-regression/`. Add `QUILL_REGRESSION_FULL=1` and select
+`LocalSessionRegression.fullSessionStructuralReport` to replay the entire
+session. These tests measure structural fidelity, not word or speaker error
+rates; those require human reference annotations.
+
+## Models and dependencies
+
+FluidAudio is an external Apache-2.0 open-source Swift package, not an
+Apple-shipped framework. Quill uses its Core ML ports of Parakeet, Silero VAD,
+and LS-EEND. Apple supplies the Core ML runtime and AVFoundation/Core Audio
+capture APIs. The speech model files download into FluidAudio's local
+Application Support cache before the first transcribed recording.
+
+Parakeet v2 is English-only. LS-EEND supports up to 10 speakers; Quill
+preserves all model speaker indices and does not perform cross-track voice
+matching.
+
+## Config
+
+Optional config lives at `~/.config/quill/config.json`:
+
+```json
+{
+  "recordings_dir": "~/Recordings",
+  "transcription": { "enabled": true },
+  "mic_voice_processing": false,
+  "on_stop": "my-hook"
+}
+```
+
+- `recordings_dir`: output root. `--out` takes precedence.
+- `transcription.enabled`: set to `false` for audio-only recording.
+- `mic_voice_processing`: Apple echo cancellation for meetings played through
+  speakers. It can slightly duck other playback, so it defaults to `false`.
+- `on_stop`: shell command invoked with the session directory after the JSON
+  reaches `complete`, or immediately after an audio-only recording stops.
 
 ## Stack
 
-- **Swift** — single SPM executable target
-- **Core Audio process tap** (`AudioHardwareCreateProcessTap`, macOS 14.2+) —
-  system audio capture via a private aggregate device
-- **AVAudioEngine** — mic capture
-- **AVAudioFile** — streaming AAC encode into CAF
-- **FluidAudio / Parakeet** — on-device Core ML transcription
-- **NSStatusItem** — the whole UI
+- Swift and Swift Package Manager
+- Core Audio process taps for system audio
+- AVAudioEngine and AVAudioFile for capture
+- FluidAudio with Parakeet, Silero VAD, and LS-EEND for local speech processing
+- Core ML for model execution
 
-## Gotchas
-
-- A global tap records *everything* the Mac plays — notification dings,
-  music, all of it. Don't play Spotify during meetings (or ask for a
-  per-process picker if it bothers you).
-- If recordings come out silent, check System Settings → Privacy & Security →
-  Screen & System Audio Recording.
-- Parakeet v2 is English-only. Other languages will come with the Whisper
-  engine.
-- The binary embeds its Info.plist (`__TEXT,__info_plist`) so TCC can
-  attribute permissions to quill itself when running as a LaunchAgent.
+The global system tap records every sound the Mac plays, including notification
+sounds and music. If a track is silent, check **System Settings → Privacy &
+Security → Microphone** and **Screen & System Audio Recording**.

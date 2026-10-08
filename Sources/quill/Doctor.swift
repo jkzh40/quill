@@ -76,8 +76,8 @@ enum DoctorReport {
         return Check(name: "recordings folder", status: .ok, remediation: nil)
     }
 
-    /// Never discover a missing model after an important meeting: report
-    /// whether the parakeet models are already in FluidAudio's cache.
+    /// Report the complete live stack. Recording still performs an actual
+    /// load before capture, which is the authoritative readiness check.
     static func checkTranscription() -> Check {
         guard Config.transcriptionEnabled() else {
             return Check(
@@ -86,18 +86,56 @@ enum DoctorReport {
                 remediation: nil
             )
         }
-        let cache = AsrModels.defaultCacheDirectory(for: .v2)
-        if AsrModels.modelsExist(at: cache, version: .v2) {
+        let fileManager = FileManager.default
+        let modelsRoot = fileManager.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        )[0].appendingPathComponent("FluidAudio/Models")
+        let asrReady = AsrModels.modelsExist(
+            at: AsrModels.defaultCacheDirectory(for: .v2),
+            version: .v2
+        )
+        let vadReady = ModelNames.VAD.requiredModels.allSatisfy {
+            fileManager.fileExists(
+                atPath: modelsRoot
+                    .appendingPathComponent(Repo.vad.folderName)
+                    .appendingPathComponent($0).path
+            )
+        }
+        let variant = LSEENDVariant.dihard3
+        let step = LSEENDStepSize.step100ms
+        let relativeModel = variant.fileName(forStep: step)
+        let relativePath = variant.repo.subPath.map { "\($0)/\(relativeModel)" }
+            ?? relativeModel
+        let diarizerReady = fileManager.fileExists(
+            atPath: modelsRoot
+                .appendingPathComponent(variant.repo.folderName)
+                .appendingPathComponent(relativePath).path
+        )
+        if asrReady && vadReady && diarizerReady {
             return Check(name: "transcription", status: .ok, remediation: nil)
         }
+        var missing: [String] = []
+        if !asrReady { missing.append("Parakeet") }
+        if !vadReady { missing.append("Silero VAD") }
+        if !diarizerReady { missing.append("LS-EEND") }
         return Check(
             name: "transcription",
-            status: .warn("parakeet models not downloaded (~600 MB)"),
-            remediation: "downloads automatically on first transcription — record a short test session while online"
+            status: .warn("models not cached: \(missing.joined(separator: ", "))"),
+            remediation: "downloads and validates them before recording starts — run a short test while online"
         )
     }
 
     static func print(_ checks: [Check]) {
+        write(checks, to: nil)
+    }
+
+    static func printToStandardError(_ checks: [Check]) {
+        write(checks, to: .standardError)
+    }
+
+    private static func write(_ checks: [Check], to handle: FileHandle?) {
+        var lines: [String] = []
         for c in checks {
             let (mark, label): (String, String) = {
                 switch c.status {
@@ -106,10 +144,16 @@ enum DoctorReport {
                 case .fail(let msg): return ("✗", msg)
                 }
             }()
-            Swift.print("\(mark) \(c.name): \(label)")
+            lines.append("\(mark) \(c.name): \(label)")
             if let r = c.remediation {
-                Swift.print("    → \(r)")
+                lines.append("    → \(r)")
             }
+        }
+        let output = lines.joined(separator: "\n") + "\n"
+        if let handle {
+            handle.write(Data(output.utf8))
+        } else {
+            Swift.print(output, terminator: "")
         }
     }
 

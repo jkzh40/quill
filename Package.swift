@@ -18,8 +18,8 @@ let package = Package(
             exclude: ["Info.plist"],
             linkerSettings: [
                 // Embed Info.plist into the binary so TCC can attribute the
-                // system-audio-capture permission to quill itself when it
-                // runs as a LaunchAgent (no .app bundle to carry a plist).
+                // system-audio-capture permission to the standalone quill
+                // binary (there is no .app bundle to carry a plist).
                 .unsafeFlags([
                     "-Xlinker", "-sectcreate",
                     "-Xlinker", "__TEXT",
@@ -30,7 +30,8 @@ let package = Package(
         ),
         .testTarget(
             name: "quillTests",
-            dependencies: ["quill", .product(name: "FluidAudio", package: "FluidAudio")]
+            dependencies: ["quill", .product(name: "FluidAudio", package: "FluidAudio")],
+            resources: [.process("Fixtures")]
         ),
     ]
 )

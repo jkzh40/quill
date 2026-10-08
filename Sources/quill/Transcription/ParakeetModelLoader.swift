@@ -24,9 +24,9 @@ enum ParakeetModelLoader {
         }
     }
 
-    /// Model loading happens before capture and before Quill starts any other
-    /// worker that writes stdout. Temporarily capture fd 1, remove only the
-    /// byte-exact known warning, then replay every other diagnostic unchanged.
+    /// Model loading happens before capture. Temporarily capture fd 1, remove
+    /// only the byte-exact known warning, then replay every other diagnostic
+    /// to stderr so headless stdout remains a transcript-only data channel.
     private static func filteringKnownDiagnostic<T>(
         _ operation: () async throws -> T
     ) async throws -> T {
@@ -64,10 +64,10 @@ enum ParakeetModelLoader {
         if let text = String(data: captured, encoding: .utf8) {
             let filtered = text.replacingOccurrences(of: knownCoreMLDiagnostic, with: "")
             if !filtered.isEmpty {
-                FileHandle.standardOutput.write(Data(filtered.utf8))
+                FileHandle.standardError.write(Data(filtered.utf8))
             }
         } else if !captured.isEmpty {
-            FileHandle.standardOutput.write(captured)
+            FileHandle.standardError.write(captured)
         }
 
         return try result.get()

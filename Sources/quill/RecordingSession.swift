@@ -1,15 +1,16 @@
 import Foundation
 
 /// One meeting recording: a timestamped folder holding two independent tracks
-/// (mic = you, system = them) plus a meta.json written on clean stop. Tracks
-/// are separate on purpose — whisper does better on clean single-source audio,
-/// and two tracks give free two-party diarization.
+/// plus a meta.json that is created before capture begins and updated on stop.
+/// Creating metadata up front makes an interrupted session discoverable by the
+/// recovery scanner even when the process never reaches `stop()`.
 final class RecordingSession {
     let dir: URL
     let startedAt = Date()
 
-    private let mic: MicRecorder
-    private let system: SystemAudioRecorder
+    private var mic: MicRecorder
+    private var system: SystemAudioRecorder
+    private let transcriptionEnabled: Bool
 
     private static let folderFormat: DateFormatter = {
         let f = DateFormatter()
@@ -22,9 +23,11 @@ final class RecordingSession {
     /// collision) without starting capture yet.
     init(
         root: URL,
+        transcriptionEnabled: Bool = Config.transcriptionEnabled(),
         onMicBuffer: AudioBufferHandler? = nil,
         onSystemBuffer: AudioBufferHandler? = nil
     ) throws {
+        self.transcriptionEnabled = transcriptionEnabled
         mic = MicRecorder(onBuffer: onMicBuffer)
         system = SystemAudioRecorder(onBuffer: onSystemBuffer)
 
@@ -37,6 +40,18 @@ final class RecordingSession {
         }
         try FileManager.default.createDirectory(at: candidate, withIntermediateDirectories: true)
         dir = candidate
+        try writeMeta(status: "recording", endedAt: nil)
+    }
+
+    /// Attach live consumers after the session directory exists but before
+    /// capture starts. The live store needs that directory for transcript.json.
+    func setBufferHandlers(
+        mic onMicBuffer: AudioBufferHandler?,
+        system onSystemBuffer: AudioBufferHandler?
+    ) {
+        precondition(!mic.isRecording && !system.isRecording)
+        mic = MicRecorder(onBuffer: onMicBuffer)
+        system = SystemAudioRecorder(onBuffer: onSystemBuffer)
     }
 
     /// Start both tracks. If the mic fails after the system tap started, the
@@ -51,35 +66,47 @@ final class RecordingSession {
         }
     }
 
-    /// Stop both tracks and write meta.json.
+    /// Stop both tracks and atomically mark meta.json complete.
     func stop() {
         mic.stop()
         system.stop()
 
-        let ended = Date()
-        let iso = ISO8601DateFormatter()
+        try? writeMeta(status: "complete", endedAt: Date())
+    }
 
-        // The tracks don't start on the same buffer; record how far each
-        // lags the earliest so transcript timestamps share one clock.
+    /// Offsets on the shared session clock, available once first buffers have
+    /// arrived. Missing/silent tracks begin at the session origin.
+    var trackOffsetsMs: [TranscriptTrackID: Int] {
         let micStart = mic.firstBufferAt ?? startedAt
         let systemStart = system.firstBufferAt ?? startedAt
         let earliest = min(micStart, systemStart)
+        return [
+            .mic: Int((micStart.timeIntervalSince(earliest) * 1000).rounded()),
+            .system: Int((systemStart.timeIntervalSince(earliest) * 1000).rounded()),
+        ]
+    }
 
-        let meta: [String: Any] = [
+    private func writeMeta(status: String, endedAt: Date?) throws {
+        let iso = ISO8601DateFormatter()
+        var meta: [String: Any] = [
+            "schema_version": 1,
+            "status": status,
             "started": iso.string(from: startedAt),
-            "ended": iso.string(from: ended),
-            "duration_seconds": Int(ended.timeIntervalSince(startedAt)),
+            "transcription_enabled": transcriptionEnabled,
             "files": ["mic": "mic.caf", "system": "system.caf"],
             "start_offset_ms": [
-                "mic": Int(micStart.timeIntervalSince(earliest) * 1000),
-                "system": Int(systemStart.timeIntervalSince(earliest) * 1000),
+                "mic": trackOffsetsMs[.mic] ?? 0,
+                "system": trackOffsetsMs[.system] ?? 0,
             ],
         ]
-        if let data = try? JSONSerialization.data(
+        if let endedAt {
+            meta["ended"] = iso.string(from: endedAt)
+            meta["duration_seconds"] = Int(endedAt.timeIntervalSince(startedAt))
+        }
+        let data = try JSONSerialization.data(
             withJSONObject: meta,
             options: [.prettyPrinted, .sortedKeys]
-        ) {
-            try? data.write(to: dir.appendingPathComponent("meta.json"))
-        }
+        )
+        try data.write(to: dir.appendingPathComponent("meta.json"), options: .atomic)
     }
 }
