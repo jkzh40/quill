@@ -1,0 +1,19 @@
+#!/bin/sh
+# Builds quill in release mode when its sources are newer than the binary, then
+# runs it with the given arguments. A symlink to this script finds the checkout
+# through the link.
+#
+# Usage: bin/quill [command] [options]
+# Exits: quill's status. A failed build exits with swift build's status.
+set -eu
+
+ROOT=$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)
+BINARY="$ROOT/.build/release/quill"
+
+if [ ! -x "$BINARY" ] ||
+    find "$ROOT/Sources" "$ROOT/Package.swift" -type f -newer "$BINARY" -print -quit | grep -q .; then
+    echo "quill: building the CLI" >&2
+    swift build --package-path "$ROOT" -c release >&2
+fi
+
+exec "$BINARY" "$@"
